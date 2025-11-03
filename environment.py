@@ -176,6 +176,34 @@ class CoverageEnvironment:
 
         return self.robot_state, reward, done, info
 
+    def get_valid_actions(self) -> np.ndarray:
+        """
+        Get mask of valid actions (actions that don't lead to collision).
+        
+        Returns:
+            valid_mask: Boolean array [N_ACTIONS] where True = valid action
+        """
+        valid_mask = np.ones(config.N_ACTIONS, dtype=bool)
+        
+        current_x, current_y = self.robot_state.position
+        
+        for action in range(config.N_ACTIONS):
+            dx, dy = config.ACTION_DELTAS[action]
+            new_x = current_x + dx
+            new_y = current_y + dy
+            new_pos = (new_x, new_y)
+            
+            # Check boundaries
+            if not (0 <= new_x < self.grid_size and 0 <= new_y < self.grid_size):
+                valid_mask[action] = False
+                continue
+            
+            # Check obstacles
+            if new_pos in self.world_state.obstacles:
+                valid_mask[action] = False
+        
+        return valid_mask
+
     def _find_valid_start_position(self) -> Tuple[int, int]:
         """Find a valid (non-obstacle) starting position."""
         max_attempts = 100

@@ -452,6 +452,34 @@ class MultiAgentCoverageEnv:
         # Emergency fallback
         return (self.grid_size // 2, self.grid_size // 2)
 
+    def get_valid_actions(self, agent_id: int) -> np.ndarray:
+        """
+        Returns boolean mask of valid actions for a specific agent.
+        
+        Args:
+            agent_id: The agent to get valid actions for
+            
+        Returns:
+            Boolean array where True = valid action, False = invalid (collision)
+        """
+        valid_mask = np.ones(config.N_ACTIONS, dtype=bool)
+        current_x, current_y = self.envs[agent_id].robot_state.position
+        
+        for action in range(config.N_ACTIONS):
+            dx, dy = config.ACTION_DELTAS[action]
+            new_x, new_y = current_x + dx, current_y + dy
+            
+            # Check boundaries
+            if not (0 <= new_x < self.grid_size and 0 <= new_y < self.grid_size):
+                valid_mask[action] = False
+                continue
+                
+            # Check obstacles
+            if (new_x, new_y) in self.envs[agent_id].world_state.obstacles:
+                valid_mask[action] = False
+                
+        return valid_mask
+
     def _execute_actions_parallel(
         self,
         actions: List[int]

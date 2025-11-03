@@ -198,7 +198,7 @@ class MultiAgentTrainer:
         agent_occupancies: Optional[List] = None
     ) -> List[int]:
         """
-        Select actions for all agents (decentralized execution).
+        Select actions for all agents (decentralized execution) with action masking.
 
         Args:
             observations: List of observation dicts (one per agent)
@@ -222,11 +222,15 @@ class MultiAgentTrainer:
             world_state = obs['world_state']
             occupancy = agent_occupancies[i]
 
+            # Get valid actions for this agent (ACTION MASKING)
+            valid_actions = self.env.get_valid_actions(i)
+
             action = agent.select_action(
                 robot_state, 
                 world_state, 
                 epsilon=epsilon,
-                agent_occupancy=occupancy
+                agent_occupancy=occupancy,
+                valid_actions=valid_actions
             )
             actions.append(action)
 

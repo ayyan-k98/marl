@@ -219,16 +219,18 @@ class FCNAgent:
         robot_state: RobotState,
         world_state: WorldState,
         epsilon: Optional[float] = None,
-        agent_occupancy: Optional[np.ndarray] = None
+        agent_occupancy: Optional[np.ndarray] = None,
+        valid_actions: Optional[np.ndarray] = None
     ) -> int:
         """
-        Select action using epsilon-greedy policy.
+        Select action using epsilon-greedy policy with action masking.
 
         Args:
             robot_state: Current robot state
             world_state: World state (grid)
             epsilon: Override default epsilon
             agent_occupancy: Optional [H, W] array for 6th channel (multi-agent)
+            valid_actions: Optional boolean mask [N_ACTIONS] where True=valid action
 
         Returns:
             action: Integer action [0-8]
@@ -236,11 +238,16 @@ class FCNAgent:
         if epsilon is None:
             epsilon = self.epsilon
 
-        # Epsilon-greedy
+        # Epsilon-greedy (with action masking)
         if random.random() < epsilon:
+            # Random exploration - only from valid actions
+            if valid_actions is not None:
+                valid_indices = np.where(valid_actions)[0]
+                if len(valid_indices) > 0:
+                    return random.choice(valid_indices)
             return random.randint(0, config.N_ACTIONS - 1)
 
-        # Greedy action
+        # Greedy action (with action masking)
         with torch.no_grad():
             # Encode state to grid (with optional 6th channel)
             grid = self._encode_state(robot_state, world_state, agent_occupancy)
@@ -249,7 +256,14 @@ class FCNAgent:
             # Forward pass
             q_values = self.policy_net(grid)
 
-            # Select best action
+            # Apply action masking if provided
+            if valid_actions is not None:
+                # Mask invalid actions with large negative value
+                invalid_mask = ~torch.from_numpy(valid_actions).to(self.device)
+                q_values = q_values.clone()  # Don't modify original
+                q_values[0, invalid_mask] = -float('inf')
+
+            # Select best valid action
             action = q_values.argmax(dim=1).item()
 
         return action
