@@ -306,6 +306,48 @@ def train_multi_agent(
                   f"Eff: {efficiency_pct:5.1f}% | "
                   f"ε: {trainer.epsilon:.3f}")
             
+            # Gradient monitoring with auto-stop (check all agents)
+            max_grad_norm = 0.0
+            for i, agent in enumerate(trainer.agents):
+                if len(agent.grad_norm_history) > 0:
+                    grad_norm = agent.grad_norm_history[-1]
+                    max_grad_norm = max(max_grad_norm, grad_norm)
+            
+            if max_grad_norm > 15.0:
+                print(f"  ⚠ HIGH GRADIENT NORM: {max_grad_norm:.1f}")
+                
+                # Check if consistently high across recent episodes (convergence failure)
+                all_recent_high = True
+                for agent in trainer.agents:
+                    if len(agent.grad_norm_history) >= 10:
+                        recent_avg = np.mean(agent.grad_norm_history[-10:])
+                        if recent_avg <= 12.0:
+                            all_recent_high = False
+                            break
+                
+                if all_recent_high and episode > 50:  # Only trigger after warmup
+                    print(f"\n{'='*70}")
+                    print(f"🛑 TRAINING STOPPED: Gradient explosion detected")
+                    print(f"{'='*70}")
+                    print(f"  Max gradient norm: {max_grad_norm:.1f}")
+                    for i, agent in enumerate(trainer.agents):
+                        if len(agent.grad_norm_history) >= 10:
+                            print(f"  Agent {i} 10-ep avg: {np.mean(agent.grad_norm_history[-10:]):.1f}")
+                    print(f"  Threshold: 12.0")
+                    print(f"\nThis indicates Q-value divergence. Recommendations:")
+                    print(f"  1. Reduce learning rate further")
+                    print(f"  2. Increase target network update frequency")
+                    print(f"  3. Reduce reward scaling or team reward weight")
+                    print(f"{'='*70}\n")
+                    
+                    # Save emergency checkpoint
+                    trainer.save_checkpoint(
+                        save_dir='checkpoints',
+                        episode=episode,
+                        suffix='emergency_divergence'
+                    )
+                    break  # Stop training
+            
             # DEBUG: Print coverage map statistics
             # Show Agent 0's local coverage (not shared world_state coverage_map)
             observations = env.get_observations()

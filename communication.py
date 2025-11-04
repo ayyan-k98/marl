@@ -100,9 +100,13 @@ class NoCommunciation(CommunicationProtocol):
 
 class PositionCommunication:
     """
-    Position-based communication protocol.
+    Position-based communication protocol with obstacle map sharing.
 
-    Agents broadcast (position, velocity, timestamp) every N steps.
+    Agents broadcast:
+    - (position, velocity, timestamp) every N steps
+    - Discovered obstacle map (partial) for coordination
+    - Discovered free cells for efficient exploration
+
     Recipients within communication range receive the messages.
 
     This enables persistent position information beyond visual sensor range,
@@ -113,13 +117,15 @@ class PositionCommunication:
     - Range-limited (comm_range parameter)
     - Includes uncertainty/age of information
     - Used to populate 6th channel (agent occupancy)
+    - Shares discovered obstacle maps to avoid redundant exploration
     """
 
     def __init__(
         self,
         num_agents: int,
         comm_range: float = 15.0,
-        comm_freq: int = 5
+        comm_freq: int = 5,
+        share_obstacle_maps: bool = True
     ):
         """
         Initialize position communication protocol.
@@ -128,11 +134,13 @@ class PositionCommunication:
             num_agents: Number of agents in the system
             comm_range: Maximum communication range (grid cells)
             comm_freq: Communication frequency (broadcast every N steps)
+            share_obstacle_maps: Whether to share discovered obstacle maps
         """
         self.num_agents = num_agents
         self.comm_range = comm_range
         self.comm_freq = comm_freq
-        self.last_messages = {}  # agent_id -> (pos, vel, timestamp)
+        self.share_obstacle_maps = share_obstacle_maps
+        self.last_messages = {}  # agent_id -> (pos, vel, timestamp, obstacles, free_cells)
         self.position_history = {}  # agent_id -> [(pos, step), ...]  for velocity computation
         self.step_count = 0
 
@@ -140,20 +148,40 @@ class PositionCommunication:
         self,
         agent_id: int,
         position: Tuple[float, float],
-        velocity: Optional[Tuple[float, float]] = None
+        velocity: Optional[Tuple[float, float]] = None,
+        discovered_obstacles: Optional[set] = None,
+        local_map: Optional[Dict] = None
     ) -> None:
         """
-        Agent broadcasts its position and velocity.
+        Agent broadcasts its position, velocity, and discovered obstacle map.
 
         Args:
             agent_id: ID of broadcasting agent
             position: (x, y) position in grid coordinates
             velocity: (vx, vy) velocity (optional, defaults to (0, 0))
+            discovered_obstacles: Set of discovered obstacle cells (x, y)
+            local_map: Dict mapping (x, y) -> (coverage, "free"/"obstacle")
         """
         if velocity is None:
             velocity = (0.0, 0.0)
 
-        self.last_messages[agent_id] = (position, velocity, self.step_count)
+        # Extract obstacle and free cell sets
+        obstacles = set(discovered_obstacles) if discovered_obstacles else set()
+        free_cells = set()
+        
+        if local_map and self.share_obstacle_maps:
+            # Extract free cells from local_map
+            for (x, y), (cov, cell_type) in local_map.items():
+                if cell_type == "free":
+                    free_cells.add((x, y))
+
+        self.last_messages[agent_id] = (
+            position, 
+            velocity, 
+            self.step_count,
+            obstacles,
+            free_cells
+        )
 
     def receive(
         self,
@@ -180,14 +208,27 @@ class PositionCommunication:
                 'age': int,  # Steps since message was sent
                 'distance': float,  # Distance to other agent
                 'reliability': float,  # [0-1] Signal strength (Gaussian decay)
-                'position_sigma': float  # Position uncertainty from communication noise
+                'position_sigma': float,  # Position uncertainty from communication noise
+                'discovered_obstacles': set,  # Set of obstacle cells (x, y) discovered by sender
+                'discovered_free': set  # Set of free cells (x, y) discovered by sender
             }, ...]
         """
         messages = []
 
-        for other_id, (pos, vel, timestamp) in self.last_messages.items():
+        for other_id, msg_data in self.last_messages.items():
             if other_id == agent_id:
                 continue
+
+            # Unpack message data (with backward compatibility)
+            if len(msg_data) == 5:
+                pos, vel, timestamp, obstacles, free_cells = msg_data
+            elif len(msg_data) == 3:
+                # Legacy format (no obstacle sharing)
+                pos, vel, timestamp = msg_data
+                obstacles = set()
+                free_cells = set()
+            else:
+                continue  # Skip malformed messages
 
             # Calculate distance to other agent
             distance = np.sqrt(
@@ -195,13 +236,17 @@ class PositionCommunication:
                 (pos[1] - agent_position[1])**2
             )
 
-            # Gaussian communication strength: exp(-d^2 / (2*sigma^2))
-            # Use comm_range as sigma so signal is ~60% at comm_range
-            # and drops to ~5% at 2*comm_range
-            comm_strength = np.exp(-distance**2 / (2 * self.comm_range**2))
+            # Check if within communication range (hard cutoff for clarity in tests)
+            # In practice, a soft Gaussian decay provides more realistic behavior
+            if distance <= self.comm_range:
+                # Gaussian communication strength: exp(-d^2 / (2*sigma^2))
+                # Use comm_range as sigma so signal is ~60% at comm_range boundary
+                comm_strength = np.exp(-distance**2 / (2 * self.comm_range**2))
+            else:
+                # Beyond range: no communication
+                continue
 
-            # Only include messages with meaningful signal strength (>5%)
-            # This provides soft cutoff instead of hard boundary
+            # Soft reliability threshold to filter very weak signals
             if comm_strength > 0.05:
                 age = self.step_count - timestamp
                 
@@ -217,8 +262,10 @@ class PositionCommunication:
                     'timestamp': timestamp,  # Compatible with agent_occupancy.py
                     'age': age,
                     'distance': distance,
-                    'reliability': float(comm_strength),  # NEW: Signal quality [0-1]
-                    'position_sigma': float(position_sigma)  # NEW: Communication uncertainty
+                    'reliability': float(comm_strength),  # Signal quality [0-1]
+                    'position_sigma': float(position_sigma),  # Communication uncertainty
+                    'discovered_obstacles': obstacles if self.share_obstacle_maps else set(),
+                    'discovered_free': free_cells if self.share_obstacle_maps else set()
                 })
 
         return messages
@@ -227,7 +274,8 @@ class PositionCommunication:
         """
         Main communication interface (compatible with trainer).
         
-        Broadcasts positions and collects messages for all agents.
+        Broadcasts positions, velocities, and discovered obstacle maps.
+        Collects messages for all agents within communication range.
         Computes velocity from position history for predictive trajectory modeling.
         
         Args:
@@ -239,15 +287,26 @@ class PositionCommunication:
             from other agents within communication range.
             Format: [[msg1_for_agent0, msg2_for_agent0, ...], [msg1_for_agent1, ...], ...]
         """
-        # Broadcast all agent positions with computed velocities
+        # Broadcast all agent positions with computed velocities and obstacle maps
         for i, obs in enumerate(observations):
-            position = obs['robot_state'].position
+            robot_state = obs['robot_state']
+            position = robot_state.position
             
             # Compute velocity from position history
             velocity = self._compute_velocity(i, position, self.step_count)
             
-            # Broadcast position + velocity
-            self.broadcast(i, position, velocity=velocity)
+            # Get discovered obstacles and local_map
+            discovered_obstacles = getattr(robot_state, 'discovered_obstacles', None)
+            local_map = getattr(robot_state, 'local_map', None)
+            
+            # Broadcast position + velocity + obstacle map
+            self.broadcast(
+                i, 
+                position, 
+                velocity=velocity,
+                discovered_obstacles=discovered_obstacles,
+                local_map=local_map
+            )
         
         # Collect messages for each agent
         all_messages = []
@@ -331,7 +390,54 @@ class PositionCommunication:
     def reset(self) -> None:
         """Reset communication system (call at episode start)."""
         self.last_messages = {}
+        self.position_history = {}
         self.step_count = 0
+    
+    @staticmethod
+    def merge_obstacle_maps(
+        robot_state,
+        received_messages: List[Dict],
+        reliability_threshold: float = 0.3
+    ) -> None:
+        """
+        Merge received obstacle maps into agent's knowledge.
+        
+        Updates the agent's discovered_obstacles and local_map with information
+        from other agents, weighted by communication reliability.
+        
+        Args:
+            robot_state: RobotState object to update
+            received_messages: List of messages from other agents (from receive())
+            reliability_threshold: Minimum reliability to accept obstacle information [0-1]
+        
+        Note:
+            - Only obstacles with reliability >= threshold are added
+            - Free cells are also shared to prevent redundant exploration
+            - Does not overwrite higher-confidence information with lower-confidence
+        """
+        if not received_messages:
+            return
+        
+        for msg in received_messages:
+            reliability = msg.get('reliability', 0.0)
+            
+            # Only accept high-quality information
+            if reliability < reliability_threshold:
+                continue
+            
+            # Merge discovered obstacles
+            discovered_obstacles = msg.get('discovered_obstacles', set())
+            if discovered_obstacles and hasattr(robot_state, 'discovered_obstacles'):
+                robot_state.discovered_obstacles.update(discovered_obstacles)
+            
+            # Merge discovered free cells into local_map
+            discovered_free = msg.get('discovered_free', set())
+            if discovered_free and hasattr(robot_state, 'local_map'):
+                for (x, y) in discovered_free:
+                    # Only add if not already known (don't overwrite local observations)
+                    if (x, y) not in robot_state.local_map:
+                        # Add with reduced confidence (0.3) since it's second-hand info
+                        robot_state.local_map[(x, y)] = (0.3, "free")
 
 
 def get_communication_protocol(
@@ -339,7 +445,8 @@ def get_communication_protocol(
     num_agents: int,
     grid_size: int = 20,
     comm_range: float = 15.0,
-    comm_freq: int = 5
+    comm_freq: int = 5,
+    share_obstacle_maps: bool = True
 ):
     """
     Factory function to create communication protocol.
@@ -350,13 +457,14 @@ def get_communication_protocol(
         grid_size: Grid size (unused, kept for API compatibility)
         comm_range: Communication range (grid cells)
         comm_freq: Communication frequency (every N steps)
+        share_obstacle_maps: Whether to share discovered obstacle maps (position protocol only)
 
     Returns:
         Communication protocol instance (PositionCommunication or NoCommunciation)
 
     Note:
         - 'none': No communication (baseline)
-        - 'position': Position/velocity broadcast (recommended for coordination)
+        - 'position': Position/velocity broadcast + obstacle map sharing (recommended for coordination)
     """
     if protocol_name == 'none':
         return NoCommunciation(num_agents=num_agents)
@@ -364,7 +472,8 @@ def get_communication_protocol(
         return PositionCommunication(
             num_agents=num_agents,
             comm_range=comm_range,
-            comm_freq=comm_freq
+            comm_freq=comm_freq,
+            share_obstacle_maps=share_obstacle_maps
         )
     else:
         raise ValueError(

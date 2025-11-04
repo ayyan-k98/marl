@@ -19,25 +19,31 @@ class RobotState:
     orientation: float  # Radians
     local_map: Dict[Tuple[int, int], Tuple[float, str]] = field(default_factory=dict)
     visited_positions: Set[Tuple[int, int]] = field(default_factory=set)
+    discovered_obstacles: Set[Tuple[int, int]] = field(default_factory=set)  # Persistent obstacle memory
     last_action: int = 8  # STAY
     coverage_history: np.ndarray = None
     visit_heat: np.ndarray = None
     coverage_over_time: List[float] = field(default_factory=list)  # Track coverage progression
+    grid_size: int = None  # Grid size for proper initialization
 
     def __post_init__(self):
+        # Use grid_size if provided, otherwise fall back to config
+        gs = self.grid_size if self.grid_size is not None else config.GRID_SIZE
+        
         if self.coverage_history is None:
             self.coverage_history = np.zeros(
-                (config.GRID_SIZE, config.GRID_SIZE), dtype=np.float32
+                (gs, gs), dtype=np.float32
             )
         if self.visit_heat is None:
             self.visit_heat = np.zeros(
-                (config.GRID_SIZE, config.GRID_SIZE), dtype=np.float32
+                (gs, gs), dtype=np.float32
             )
 
     def reset_maps(self):
         """Reset local maps for new episode."""
         self.local_map = {}
         self.visited_positions = set()
+        self.discovered_obstacles = set()
         self.coverage_history.fill(0.0)
         self.visit_heat.fill(0.0)
         self.last_action = 8

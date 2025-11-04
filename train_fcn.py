@@ -144,10 +144,13 @@ def train_fcn_stage1(
                 if enable_timing:
                     time_encoding += time.time() - t0
 
+                # Get valid actions (ACTION MASKING)
+                valid_actions = env.get_valid_actions()
+                
                 # Select action using pre-encoded grid
                 if enable_timing:
                     t0 = time.time()
-                action = agent.select_action_from_tensor(grid_tensor)
+                action = agent.select_action_from_tensor(grid_tensor, valid_actions=valid_actions)
                 if enable_timing:
                     time_action += time.time() - t0
 
@@ -186,6 +189,9 @@ def train_fcn_stage1(
             # Episode completed
             episode_time = time.time() - episode_start_time
             final_coverage = info.get('coverage_pct', 0.0)
+            early_completion = info.get('early_completion', False)
+            completion_bonus = info.get('completion_bonus', 0.0)
+            time_bonus = info.get('time_bonus', 0.0)
 
             # Decay epsilon FIRST
             agent.decay_epsilon(decay_rate=epsilon_decay)
@@ -201,6 +207,13 @@ def train_fcn_stage1(
                 length=step + 1,
                 epsilon=agent.epsilon
             )
+            
+            # Log early completion
+            if early_completion and verbose:
+                total_bonus = completion_bonus + time_bonus
+                steps_saved = config.MAX_EPISODE_STEPS - (step + 1)
+                print(f"  🎯 Early completion! Coverage: {final_coverage:.1%} in {step + 1} steps (saved {steps_saved} steps)")
+                print(f"     Bonus: +{total_bonus:.2f} (completion: +{completion_bonus:.1f}, time: +{time_bonus:.2f})")
 
             # Timing breakdown (first few episodes)
             if enable_timing:
@@ -223,11 +236,35 @@ def train_fcn_stage1(
                       f"Loss: {avg_loss:.4f} | "
                       f"Time: {episode_time:.1f}s")
 
-                # Gradient monitoring
+                # Gradient monitoring with auto-stop
                 if len(agent.grad_norm_history) > 0:
                     recent_grad_norm = agent.grad_norm_history[-1]
                     if recent_grad_norm > 15.0:
-                        print(f"  ⚠ High gradient norm: {recent_grad_norm:.1f}")
+                        print(f"  ⚠ HIGH GRADIENT NORM: {recent_grad_norm:.1f}")
+                        
+                        # Check if consistently high (convergence failure)
+                        if len(agent.grad_norm_history) >= 10:
+                            recent_10_avg = np.mean(agent.grad_norm_history[-10:])
+                            if recent_10_avg > 12.0:
+                                print(f"\n{'='*80}")
+                                print(f"🛑 TRAINING STOPPED: Gradient explosion detected")
+                                print(f"{'='*80}")
+                                print(f"  Recent gradient norm: {recent_grad_norm:.1f}")
+                                print(f"  10-episode average: {recent_10_avg:.1f}")
+                                print(f"  Threshold: 12.0")
+                                print(f"\nThis indicates Q-value divergence. Recommendations:")
+                                print(f"  1. Reduce learning rate further (current: {agent.optimizer.param_groups[0]['lr']:.2e})")
+                                print(f"  2. Increase target network update frequency (current: {config.TARGET_UPDATE_FREQ})")
+                                print(f"  3. Reduce reward scaling")
+                                print(f"  4. Check for reward engineering bugs")
+                                print(f"{'='*80}\n")
+                                
+                                # Save emergency checkpoint
+                                emergency_path = os.path.join(config.CHECKPOINT_DIR, "fcn_emergency_divergence.pt")
+                                agent.save(emergency_path)
+                                print(f"Emergency checkpoint saved: {emergency_path}")
+                                
+                                return agent, metrics  # Stop training
 
             # Validation
             if (episode + 1) % validate_interval == 0:
@@ -244,11 +281,12 @@ def train_fcn_stage1(
                     print(f"  Average:      {val_results['avg']:.1%}")
                     print(f"{'='*80}\n")
 
-            # Update target network
+            # Update target network (with Polyak averaging if enabled)
             if (episode + 1) % config.TARGET_UPDATE_FREQ == 0:
                 agent.update_target_network()
                 if verbose:
-                    print(f"  ✓ Target network updated")
+                    update_type = "soft (Polyak)" if getattr(config, 'USE_POLYAK_AVERAGING', False) else "hard"
+                    print(f"  ✓ Target network updated ({update_type})")
 
             # Save checkpoint
             if (episode + 1) % checkpoint_interval == 0:
@@ -331,7 +369,9 @@ def validate_fcn(
             max_steps = config.VALIDATION_MAX_STEPS if config.FAST_VALIDATION else config.MAX_EPISODE_STEPS
 
             for step in range(max_steps):
-                action = agent.select_action(state, env.world_state, agent_occupancy=dummy_occupancy)
+                # Get valid actions (ACTION MASKING)
+                valid_actions = env.get_valid_actions()
+                action = agent.select_action(state, env.world_state, agent_occupancy=dummy_occupancy, valid_actions=valid_actions)
                 state, reward, done, info = env.step(action)
 
                 if done:

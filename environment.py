@@ -108,7 +108,8 @@ class CoverageEnvironment:
         # Initialize robot state
         self.robot_state = RobotState(
             position=start_pos,
-            orientation=random.uniform(0, 2 * math.pi)
+            orientation=random.uniform(0, 2 * math.pi),
+            grid_size=self.grid_size
         )
 
         # Reset tracking
@@ -164,6 +165,25 @@ class CoverageEnvironment:
 
         # Check termination
         done = self._check_done()
+        
+        # Early termination completion bonus
+        early_completion = False
+        if done and self.steps < self.max_steps:
+            # Check if this is early termination due to coverage goal
+            coverage_pct = self._get_coverage_percentage()  # Already returns 0.0-1.0!
+            if (config.ENABLE_EARLY_TERMINATION and 
+                self.steps >= config.EARLY_TERM_MIN_STEPS and
+                coverage_pct >= config.EARLY_TERM_COVERAGE_TARGET):
+                
+                # Add completion bonus
+                reward += config.EARLY_TERM_COMPLETION_BONUS
+                
+                # Add time bonus for steps saved
+                steps_saved = self.max_steps - self.steps
+                time_bonus = steps_saved * config.EARLY_TERM_TIME_BONUS_PER_STEP
+                reward += time_bonus
+                
+                early_completion = True
 
         # Info for stratified replay
         info = {
@@ -171,7 +191,10 @@ class CoverageEnvironment:
             'knowledge_gain': knowledge_gain,
             'collision': collision,
             'coverage_pct': self._get_coverage_percentage(),
-            'steps': self.steps
+            'steps': self.steps,
+            'early_completion': early_completion,
+            'completion_bonus': config.EARLY_TERM_COMPLETION_BONUS if early_completion else 0.0,
+            'time_bonus': (self.max_steps - self.steps) * config.EARLY_TERM_TIME_BONUS_PER_STEP if early_completion else 0.0
         }
 
         return self.robot_state, reward, done, info
@@ -199,7 +222,9 @@ class CoverageEnvironment:
                 continue
             
             # Check obstacles
-            if new_pos in self.world_state.obstacles:
+            # For POMDP, only consider KNOWN obstacles when masking actions.
+            # Unknown cells should remain selectable (agent may try and collide).
+            if hasattr(self.robot_state, 'discovered_obstacles') and new_pos in self.robot_state.discovered_obstacles:
                 valid_mask[action] = False
         
         return valid_mask
@@ -278,14 +303,11 @@ class CoverageEnvironment:
         # Update local map with sensed cells
         for cell in sensed_cells:
             if cell in self.world_state.obstacles:
-                # Sensed obstacle
+                # Sensed obstacle - add to permanent memory
                 self.robot_state.local_map[cell] = (0.0, "obstacle")
+                self.robot_state.discovered_obstacles.add(cell)
             else:
-                # Sensed free cell - update coverage
-                coverage = self.world_state.coverage_map[cell[0], cell[1]]
-                self.robot_state.local_map[cell] = (coverage, "free")
-
-                # Update coverage based on distance from robot
+                # Sensed free cell - update coverage based on distance from robot
                 if config.USE_PROBABILISTIC_ENV:
                     # Probabilistic coverage: distance-based sensor model
                     # P_cov(cell | robot_pos) = 1 / (1 + e^(k*(r - r0)))
@@ -304,11 +326,21 @@ class CoverageEnvironment:
                     new_coverage = max(self.world_state.coverage_map[cell[0], cell[1]], p_cov)
                     self.world_state.coverage_map[cell[0], cell[1]] = new_coverage
                     self.robot_state.coverage_history[cell[0], cell[1]] = new_coverage
+                    
+                    # Store in local_map with updated coverage
+                    self.robot_state.local_map[cell] = (new_coverage, "free")
                 else:
-                    # Binary coverage: instant 100% at robot position
+                    # Binary coverage: instant 100% at robot position, 0% elsewhere
+                    # All sensed cells are known as free (for obstacle map), but only robot position is "covered"
                     if cell == self.robot_state.position:
                         self.world_state.coverage_map[cell[0], cell[1]] = 1.0
                         self.robot_state.coverage_history[cell[0], cell[1]] = 1.0
+                        self.robot_state.local_map[cell] = (1.0, "free")
+                    else:
+                        # Sensed but not covered - still FREE, just not covered yet
+                        # Coverage remains 0.0, but we know it's not an obstacle
+                        coverage = self.world_state.coverage_map[cell[0], cell[1]]
+                        self.robot_state.local_map[cell] = (coverage, "free")
 
     def _raycast_sensing(self, position: Tuple[int, int], orientation: float) -> Set[Tuple[int, int]]:
         """
@@ -484,15 +516,27 @@ class CoverageEnvironment:
         return frontier_count
 
     def _check_done(self) -> bool:
-        """Check if episode should terminate."""
+        """
+        Check if episode should terminate.
+        
+        Termination conditions:
+        1. Max steps reached
+        2. Early termination: Coverage target reached (if enabled)
+        
+        Returns:
+            True if episode should end
+        """
         # Max steps reached
         if self.steps >= self.max_steps:
             return True
-
-        # Optional: Early termination if high coverage achieved
-        coverage_pct = self._get_coverage_percentage()
-        if coverage_pct > 0.95:  # 95% coverage
-            return True
+        
+        # Early termination on coverage completion (if enabled)
+        if config.ENABLE_EARLY_TERMINATION and self.steps >= config.EARLY_TERM_MIN_STEPS:
+            coverage_pct = self._get_coverage_percentage()  # Already returns 0.0-1.0!
+            if coverage_pct >= config.EARLY_TERM_COVERAGE_TARGET:
+                return True
+        
+        return False
 
         return False
 
