@@ -230,7 +230,8 @@ class MultiAgentCoverageEnv:
                 position=start_positions[i],
                 orientation=random.uniform(0, 2 * math.pi),
                 coverage_history=np.zeros((self.grid_size, self.grid_size), dtype=np.float32),
-                visit_heat=np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+                visit_heat=np.zeros((self.grid_size, self.grid_size), dtype=np.float32),
+                grid_size=self.grid_size
             )
 
             agent_state = AgentState(
@@ -463,7 +464,7 @@ class MultiAgentCoverageEnv:
             Boolean array where True = valid action, False = invalid (collision)
         """
         valid_mask = np.ones(config.N_ACTIONS, dtype=bool)
-        current_x, current_y = self.envs[agent_id].robot_state.position
+        current_x, current_y = self.state.agents[agent_id].robot_state.position
         
         for action in range(config.N_ACTIONS):
             dx, dy = config.ACTION_DELTAS[action]
@@ -474,8 +475,10 @@ class MultiAgentCoverageEnv:
                 valid_mask[action] = False
                 continue
                 
-            # Check obstacles
-            if (new_x, new_y) in self.envs[agent_id].world_state.obstacles:
+            # For POMDP, only mask if the agent already KNOWS this cell is an obstacle.
+            # This allows attempting moves into unknown cells (may result in collision).
+            agent_known_obstacles = self.state.agents[agent_id].robot_state.discovered_obstacles
+            if agent_known_obstacles and (new_x, new_y) in agent_known_obstacles:
                 valid_mask[action] = False
                 
         return valid_mask
@@ -594,7 +597,9 @@ class MultiAgentCoverageEnv:
         # Update local map and coverage
         for cell in sensed_cells:
             if cell in self.state.world_state.obstacles:
+                # Add obstacle to permanent memory (POMDP)
                 agent.robot_state.local_map[cell] = (0.0, "obstacle")
+                agent.robot_state.discovered_obstacles.add(cell)
             else:
                 # Update coverage based on distance (probabilistic mode)
                 if config.USE_PROBABILISTIC_ENV:
@@ -988,9 +993,9 @@ class MultiAgentCoverageEnv:
         # Calculate steps saved
         steps_saved = self.max_steps - steps_used
         
-        # Flat bonus + per-step bonus
-        flat_bonus = config.EARLY_TERM_COMPLETION_BONUS
-        time_bonus = steps_saved * config.EARLY_TERM_TIME_BONUS_PER_STEP
+        # Flat bonus + per-step bonus (use multi-agent specific config)
+        flat_bonus = config.EARLY_TERM_COMPLETION_BONUS_MULTI
+        time_bonus = steps_saved * config.EARLY_TERM_TIME_BONUS_PER_STEP_MULTI
         
         total_bonus = flat_bonus + time_bonus
         

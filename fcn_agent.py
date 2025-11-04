@@ -138,11 +138,9 @@ class FCNAgent:
         """
         H, W = world_state.grid_size, world_state.grid_size
 
-        # Determine number of channels based on agent_occupancy
-        n_channels = 6 if agent_occupancy is not None else 5
-
-        # Initialize channels
-        grid = np.zeros((n_channels, H, W), dtype=np.float32)
+        # Initialize grid with correct number of channels based on network architecture
+        # (not based on whether agent_occupancy is provided - single-agent tests need 6 channels too)
+        grid = np.zeros((self.input_channels, H, W), dtype=np.float32)
 
         # Channel 0: Visited cells
         visited = np.zeros((H, W), dtype=np.float32)
@@ -185,19 +183,42 @@ class FCNAgent:
         frontier = (visited == 0) & has_visited_neighbor
         grid[3] = frontier.astype(np.float32)
 
-        # Channel 4: Obstacles
+        # Channel 4: Partial obstacle map (POMDP)
+        # Encoding convention:
+        #   0.0 = unexplored / unknown
+        #   0.5 = explored free space
+        #   1.0 = explored obstacle
         obstacles = np.zeros((H, W), dtype=np.float32)
-        for (x, y) in world_state.obstacles:
+
+        # 1) Mark discovered obstacles (persistent memory)
+        if hasattr(robot_state, 'discovered_obstacles') and robot_state.discovered_obstacles:
+            for (x, y) in robot_state.discovered_obstacles:
+                if 0 <= x < W and 0 <= y < H:
+                    obstacles[y, x] = 1.0
+
+        # 2) Mark explored free cells from local_map as 0.5 (if not an obstacle)
+        # local_map entries are (coverage, "free") or (0.0, "obstacle")
+        for (x, y), (coverage, cell_type) in robot_state.local_map.items():
             if 0 <= x < W and 0 <= y < H:
-                obstacles[y, x] = 1.0
+                if cell_type == "free":
+                    # Only mark free if we haven't flagged it as an obstacle
+                    if obstacles[y, x] < 1.0:
+                        obstacles[y, x] = 0.5
+                elif cell_type == "obstacle":
+                    obstacles[y, x] = 1.0
+
         grid[4] = obstacles
 
         # Channel 5: Agent occupancy (optional, multi-agent only)
-        if agent_occupancy is not None:
-            # Validate shape
-            if agent_occupancy.shape != (H, W):
-                raise ValueError(f"agent_occupancy shape {agent_occupancy.shape} != grid shape ({H}, {W})")
-            grid[5] = agent_occupancy.astype(np.float32)
+        if self.input_channels == 6:
+            if agent_occupancy is not None:
+                # Validate shape
+                if agent_occupancy.shape != (H, W):
+                    raise ValueError(f"agent_occupancy shape {agent_occupancy.shape} != grid shape ({H}, {W})")
+                grid[5] = agent_occupancy.astype(np.float32)
+            else:
+                # Single-agent mode: create empty occupancy channel
+                grid[5] = np.zeros((H, W), dtype=np.float32)
 
         # Convert to tensor and add batch dimension
         grid_tensor = torch.from_numpy(grid).unsqueeze(0)  # [1, 5 or 6, H, W]
@@ -271,14 +292,16 @@ class FCNAgent:
     def select_action_from_tensor(
         self,
         grid_tensor: torch.Tensor,
-        epsilon: Optional[float] = None
+        epsilon: Optional[float] = None,
+        valid_actions: Optional[np.ndarray] = None
     ) -> int:
         """
-        OPTIMIZED: Select action from pre-encoded grid (avoids redundant encoding).
+        OPTIMIZED: Select action from pre-encoded grid with action masking.
 
         Args:
             grid_tensor: Pre-encoded grid tensor [1, 5, H, W] (on CPU)
             epsilon: Override default epsilon
+            valid_actions: Optional boolean mask [N_ACTIONS] where True=valid action
 
         Returns:
             action: Integer action [0-8]
@@ -286,18 +309,30 @@ class FCNAgent:
         if epsilon is None:
             epsilon = self.epsilon
 
-        # Epsilon-greedy
+        # Epsilon-greedy (with action masking)
         if random.random() < epsilon:
+            # Random exploration - only from valid actions
+            if valid_actions is not None:
+                valid_indices = np.where(valid_actions)[0]
+                if len(valid_indices) > 0:
+                    return random.choice(valid_indices)
             return random.randint(0, config.N_ACTIONS - 1)
 
-        # Greedy action
+        # Greedy action (with action masking)
         with torch.no_grad():
             grid_device = grid_tensor.to(self.device)
 
             # Forward pass
             q_values = self.policy_net(grid_device)
 
-            # Select best action
+            # Apply action masking if provided
+            if valid_actions is not None:
+                # Mask invalid actions with large negative value
+                invalid_mask = ~torch.from_numpy(valid_actions).to(self.device)
+                q_values = q_values.clone()  # Don't modify original
+                q_values[0, invalid_mask] = -float('inf')
+
+            # Select best valid action
             action = q_values.argmax(dim=1).item()
 
             # Explicit cleanup
@@ -446,11 +481,27 @@ class FCNAgent:
 
         return loss.item()
 
-    def update_target_network(self):
+    def update_target_network(self, use_polyak: bool = None, tau: float = None):
         """
-        Update target network (hard update).
+        Update target network with either hard update or Polyak averaging.
+        
+        Args:
+            use_polyak: Whether to use soft (Polyak) updates. If None, uses config.USE_POLYAK_AVERAGING
+            tau: Polyak averaging coefficient. If None, uses config.POLYAK_TAU
         """
-        self.target_net.load_state_dict(self.policy_net.state_dict())
+        if use_polyak is None:
+            use_polyak = getattr(config, 'USE_POLYAK_AVERAGING', False)
+        
+        if use_polyak:
+            # Soft update: θ' ← τθ + (1-τ)θ'
+            if tau is None:
+                tau = getattr(config, 'POLYAK_TAU', 0.005)
+            
+            for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
+                target_param.data.copy_(tau * policy_param.data + (1.0 - tau) * target_param.data)
+        else:
+            # Hard update: θ' ← θ
+            self.target_net.load_state_dict(self.policy_net.state_dict())
 
     def decay_epsilon(self, decay_rate: float = None):
         """
