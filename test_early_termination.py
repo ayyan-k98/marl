@@ -1,60 +1,44 @@
 """
-Test Early Termination Feature
-
-Quick verification that early termination works correctly:
-1. Episode terminates when coverage goal reached
-2. Bonuses are calculated correctly
-3. Info dict contains correct fields
-4. Works with different map types
+Test if trained agent can reach early termination threshold
+This will reveal if training logs showed high coverage because of early termination
 """
-
 import numpy as np
-from config import config
-from environment import CoverageEnvironment
 from fcn_agent import FCNAgent
+from environment import CoverageEnvironment
+from config import config
 
+print("=" * 80)
+print("EARLY TERMINATION THRESHOLD TEST")
+print("=" * 80)
+print(f"Early termination enabled: {config.ENABLE_EARLY_TERMINATION}")
+print(f"Coverage target for termination: {config.EARLY_TERM_COVERAGE_TARGET:.1%}")
+print(f"Min steps before termination: {config.EARLY_TERM_MIN_STEPS}")
+print("=" * 80)
+print()
 
-def test_early_termination():
-    """Test early termination with simple empty grid."""
-    
-    print("=" * 80)
-    print("TESTING EARLY TERMINATION FEATURE")
-    print("=" * 80)
-    
-    # Check config
-    print(f"\n✓ Config check:")
-    print(f"  Early termination enabled: {config.ENABLE_EARLY_TERMINATION}")
-    print(f"  Coverage target: {config.EARLY_TERM_COVERAGE_TARGET:.1%}")
-    print(f"  Min steps: {config.EARLY_TERM_MIN_STEPS}")
-    print(f"  Completion bonus: +{config.EARLY_TERM_COMPLETION_BONUS:.1f}")
-    print(f"  Time bonus: +{config.EARLY_TERM_TIME_BONUS_PER_STEP:.3f}/step")
-    print(f"  Max steps: {config.MAX_EPISODE_STEPS}")
-    
-    # Initialize
-    env = CoverageEnvironment(grid_size=20, map_type="empty")
-    agent = FCNAgent(grid_size=20, input_channels=6)
-    
-    # Run episode until coverage goal reached
-    print(f"\n✓ Running episode on empty 20×20 grid...")
+# Load checkpoint
+checkpoint_path = "./checkpoints/fcn_final.pt"
+agent = FCNAgent(grid_size=20, input_channels=6)
+agent.load(checkpoint_path)
+agent.set_epsilon(0.1)
+
+dummy_occupancy = np.zeros((20, 20), dtype=np.float32)
+
+# Test with full 350 steps
+coverages = []
+early_terms = []
+steps_taken = []
+
+for ep in range(8):
+    env = CoverageEnvironment(grid_size=20, map_type='empty')
     state = env.reset()
-    dummy_occupancy = np.zeros((20, 20), dtype=np.float32)
     
-    episode_reward = 0.0
-    step_count = 0
-    max_steps = 100  # Limit test
-    
-    early_completion_detected = False
+    max_steps = config.MAX_EPISODE_STEPS
     
     for step in range(max_steps):
-        # Encode state
-        grid_tensor = agent._encode_state(state, env.world_state, dummy_occupancy)
-        
-        # Select action
         valid_actions = env.get_valid_actions()
-        action = agent.select_action_from_tensor(grid_tensor, valid_actions=valid_actions)
-        
-        # Step
-        next_state, reward, done, info = env.step(action)
+        action = agent.select_action(state, env.world_state, agent_occupancy=dummy_occupancy, valid_actions=valid_actions)
+        state, reward, done, info = env.step(action)
         episode_reward += reward
         step_count += 1
         

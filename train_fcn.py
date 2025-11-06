@@ -100,7 +100,7 @@ def train_fcn_stage1(
             if current_phase.start_ep != previous_phase_idx:
                 # New phase started - reset epsilon to enable exploration
                 phase_duration = current_phase.end_ep - current_phase.start_ep
-                epsilon_start = 0.5  # Start at moderate exploration level
+                epsilon_start = 0.1  # Start at moderate exploration level
                 agent.set_epsilon(epsilon_start)
                 previous_phase_idx = current_phase.start_ep
                 
